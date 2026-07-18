@@ -552,6 +552,12 @@ static NTSTATUS NTAPI HookNtQueryInformationProcess(
             ProcessInformationLength == sizeof(HANDLE) &&
             Hider::IsHidden(pid, HideProcessDebugObjectHandle))
     {
+        // The native service checks the output alignment before validating the
+        // process handle or its access rights. Keep that ordering observable to
+        // callers using a restricted handle and a deliberately bad buffer.
+        if(((ULONG_PTR)ProcessInformation & (sizeof(ULONG) - 1)) != 0)
+            return STATUS_DATATYPE_MISALIGNMENT;
+
         PEPROCESS Process;
         NTSTATUS Status = ObReferenceObjectByHandle(ProcessHandle,
                           PROCESS_QUERY_INFORMATION,
@@ -568,7 +574,9 @@ static NTSTATUS NTAPI HookNtQueryInformationProcess(
 
         __try
         {
-            ProbeForWrite(ProcessInformation, sizeof(HANDLE), 4);
+            // Alignment was checked above; probe accessibility only after the
+            // process handle has passed PROCESS_QUERY_INFORMATION validation.
+            ProbeForWrite(ProcessInformation, sizeof(HANDLE), 1);
 
             if (ReturnLength != nullptr)
                 ProbeForWrite(ReturnLength, sizeof(ULONG), 1);

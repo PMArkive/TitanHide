@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
 #include <Subauth.h>
 #include "..\TitanHide\TitanHide.h"
 
@@ -72,39 +73,161 @@ bool CheckProcessDebugPort()
 
 bool CheckProcessDebugObjectHandle()
 {
-    // Much easier in ASM but C/C++ looks so much better
-    typedef int (WINAPI * pNtQueryInformationProcess)
+    typedef NTSTATUS(NTAPI * pNtQueryInformationProcess)
     (HANDLE, UINT, PVOID, ULONG, PULONG);
 
-    DWORD_PTR DebugHandle = 0;
-    int Status;
-    ULONG ReturnSize = 0;
+    const NTSTATUS StatusInfoLengthMismatch = (NTSTATUS)0xC0000004L;
+    const NTSTATUS StatusAccessViolation = (NTSTATUS)0xC0000005L;
+    const NTSTATUS StatusAccessDenied = (NTSTATUS)0xC0000022L;
+    const NTSTATUS StatusPortNotSet = (NTSTATUS)0xC0000353L;
+    const NTSTATUS StatusDatatypeMisalignment = (NTSTATUS)0x80000002L;
+    const ULONG SentinelReturnLength = 0xB6B6B6B6;
+#ifdef _WIN64
+    const ULONG UnwrittenReturnLength = SentinelReturnLength;
+#else
+    // The WOW64 thunk leaves this value when the native call does not write
+    // ReturnLength.
+    const ULONG UnwrittenReturnLength = (ULONG)-(LONG)sizeof(ULONG);
+#endif
+    const ULONG_PTR SentinelHandle = (ULONG_PTR)-1;
 
-    // Get NtQueryInformationProcess
     pNtQueryInformationProcess NtQIP = (pNtQueryInformationProcess)
                                        GetProcAddress(GetModuleHandle(TEXT("ntdll.dll")),
                                                "NtQueryInformationProcess");
-
-    Status = NtQIP(GetCurrentProcess(),
-                   30, // ProcessDebugHandle
-                   &DebugHandle, sizeof(DebugHandle), &ReturnSize);
-
-    if(Status != 0x00000000)
-    {
-        if(Status != 0xC0000353)  //STATUS_PORT_NOT_SET
-            printf("NtQueryInformationProcess failed with %X, %u\n", Status, ReturnSize);
+    if(NtQIP == nullptr)
         return false;
+
+    bool Detected = false;
+    ULONG_PTR DebugHandle = SentinelHandle;
+    ULONG ReturnSize = SentinelReturnLength;
+
+    // Length validation happens before all handle and buffer validation. It does
+    // not write either output, including ReturnLength.
+    const ULONG InvalidLengths[] = { sizeof(DebugHandle) - 1, sizeof(DebugHandle) + 1 };
+    for(ULONG Length : InvalidLengths)
+    {
+        DebugHandle = SentinelHandle;
+        ReturnSize = SentinelReturnLength;
+        NTSTATUS Status = NtQIP(GetCurrentProcess(),
+                                30, // ProcessDebugObjectHandle
+                                &DebugHandle,
+                                Length,
+                                &ReturnSize);
+        if(Status != StatusInfoLengthMismatch ||
+                DebugHandle != SentinelHandle ||
+                ReturnSize != UnwrittenReturnLength)
+        {
+            printf("ProcessDebugObjectHandle length contract mismatch: %08X, %p, %08X, %u\n",
+                   Status, (PVOID)DebugHandle, ReturnSize, Length);
+            Detected = true;
+        }
     }
 
-
-    if(DebugHandle)
+    // A null output with the exact length is probed after process-handle access.
+    ReturnSize = SentinelReturnLength;
+    NTSTATUS Status = NtQIP(GetCurrentProcess(),
+                            30,
+                            nullptr,
+                            sizeof(DebugHandle),
+                            &ReturnSize);
+    if(Status != StatusAccessViolation || ReturnSize != UnwrittenReturnLength)
     {
-        CloseHandle((HANDLE)DebugHandle);
+        printf("ProcessDebugObjectHandle null-buffer contract mismatch: %08X, %08X\n", Status, ReturnSize);
+        Detected = true;
+    }
+
+#ifdef _WIN64
+    __declspec(align(8)) unsigned char Output[sizeof(HANDLE) + 8];
+    HANDLE LimitedProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                        FALSE,
+                                        GetCurrentProcessId());
+    if(LimitedProcess != nullptr)
+    {
+        memset(Output, 0xA5, sizeof(Output));
+        ReturnSize = SentinelReturnLength;
+        Status = NtQIP(LimitedProcess,
+                       30,
+                       Output + 1,
+                       sizeof(HANDLE),
+                       &ReturnSize);
+        if(Status != StatusDatatypeMisalignment || ReturnSize != SentinelReturnLength)
+        {
+            printf("ProcessDebugObjectHandle validation-order mismatch: %08X\n", Status);
+            Detected = true;
+        }
+
+        memset(Output, 0xA5, sizeof(Output));
+        ReturnSize = SentinelReturnLength;
+        Status = NtQIP(LimitedProcess,
+                       30,
+                       Output,
+                       sizeof(HANDLE),
+                       &ReturnSize);
+        if(Status != StatusAccessDenied || ReturnSize != SentinelReturnLength)
+        {
+            printf("ProcessDebugObjectHandle access contract mismatch: %08X\n", Status);
+            Detected = true;
+        }
+        CloseHandle(LimitedProcess);
+    }
+
+    // Native x64 requires four-byte rather than pointer-size alignment.
+    memset(Output, 0xA5, sizeof(Output));
+    ReturnSize = SentinelReturnLength;
+    Status = NtQIP(GetCurrentProcess(),
+                   30,
+                   Output + 4,
+                   sizeof(HANDLE),
+                   &ReturnSize);
+    ULONG_PTR UnalignedHandle = SentinelHandle;
+    memcpy(&UnalignedHandle, Output + 4, sizeof(UnalignedHandle));
+    if(Status == STATUS_SUCCESS && UnalignedHandle != 0 && UnalignedHandle != SentinelHandle)
+        CloseHandle((HANDLE)UnalignedHandle);
+    if(Status != StatusPortNotSet || UnalignedHandle != 0 || ReturnSize != sizeof(HANDLE))
+    {
+        printf("ProcessDebugObjectHandle alignment contract mismatch: %08X\n", Status);
+        Detected = true;
+    }
+#endif
+
+    DebugHandle = SentinelHandle;
+    ReturnSize = SentinelReturnLength;
+    Status = NtQIP(GetCurrentProcess(),
+                   30,
+                   &DebugHandle,
+                   sizeof(DebugHandle),
+                   &ReturnSize);
+    if(Status == STATUS_SUCCESS)
+    {
+        if(DebugHandle != 0 && DebugHandle != SentinelHandle)
+            CloseHandle((HANDLE)DebugHandle);
         return true;
     }
+    if(Status != StatusPortNotSet || ReturnSize != sizeof(HANDLE)
+#ifdef _WIN64
+            || DebugHandle != 0
+#endif
+      )
+    {
+        printf("ProcessDebugObjectHandle result contract mismatch: %08X, %u\n", Status, ReturnSize);
+        Detected = true;
+    }
 
-    else
-        return false;
+    // The output is written before ReturnLength. This order is observable when
+    // both pointers overlap.
+    DebugHandle = SentinelHandle;
+    Status = NtQIP(GetCurrentProcess(),
+                   30,
+                   &DebugHandle,
+                   sizeof(DebugHandle),
+                   (PULONG)&DebugHandle);
+    if(Status != StatusPortNotSet || DebugHandle != sizeof(HANDLE))
+    {
+        printf("ProcessDebugObjectHandle overlap contract mismatch: %08X\n", Status);
+        Detected = true;
+    }
+
+    return Detected;
 }
 
 bool HideFromDebugger()
@@ -482,6 +605,9 @@ bool CheckNtClose()
 
 int main(int argc, char* argv[])
 {
+    if(argc == 2 && strcmp(argv[1], "--process-debug-object-contract") == 0)
+        return CheckProcessDebugObjectHandle() ? 1 : 0;
+
     char title[256] = "";
     sprintf_s(title, "pid: %d", (int)GetCurrentProcessId());
     SetConsoleTitleA(title);
