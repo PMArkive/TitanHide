@@ -974,7 +974,10 @@ static NTSTATUS NTAPI HookNtQueryObject(
 
                 OBJECT_ALL_INFORMATION* pObjectAllInfo = (OBJECT_ALL_INFORMATION*)ObjectInformation;
                 unsigned char* pObjInfoLocation = (unsigned char*)pObjectAllInfo->ObjectTypeInformation;
-                unsigned char* BufferEnd = (unsigned char*)ObjectInformation + ObjectInformationLength;
+                SIZE_T ReturnedLength = ObjectInformationLength;
+                if(ReturnLength != nullptr && TempReturnLength < ReturnedLength)
+                    ReturnedLength = TempReturnLength;
+                unsigned char* BufferEnd = (unsigned char*)ObjectInformation + ReturnedLength;
                 if(BufferEnd < (unsigned char*)ObjectInformation)
                 {
                     RESTORE_RETURNLENGTH();
@@ -984,12 +987,18 @@ static NTSTATUS NTAPI HookNtQueryObject(
                 DEBUG_OBJECT_CONTRIBUTION Contribution;
                 if(QueryDebugObjectContribution(&Contribution))
                 {
-                    // NumberOfObjects and any UNICODE_STRING member may have
-                    // been overwritten by ReturnLength. Walk bounded inline
-                    // names and use the live debug object's fixed type
-                    // descriptor as an independent identifier.
+                    // ReturnLength is the authoritative byte bound. Use the
+                    // native object count too unless ReturnLength overwrote it.
+                    const bool ObjectCountValid =
+                        !RangesOverlap(&pObjectAllInfo->NumberOfObjects,
+                                       sizeof(pObjectAllInfo->NumberOfObjects),
+                                       ReturnLength,
+                                       sizeof(ULONG));
+                    const ULONG TotalObjects = pObjectAllInfo->NumberOfObjects;
+                    ULONG ObjectsVisited = 0;
                     while(pObjInfoLocation <= BufferEnd &&
-                            (SIZE_T)(BufferEnd - pObjInfoLocation) >= sizeof(OBJECT_TYPE_INFORMATION))
+                            (SIZE_T)(BufferEnd - pObjInfoLocation) >= sizeof(OBJECT_TYPE_INFORMATION) &&
+                            (!ObjectCountValid || ObjectsVisited < TotalObjects))
                     {
                         OBJECT_TYPE_INFORMATION* pObjectTypeInfo =
                             (OBJECT_TYPE_INFORMATION*)pObjInfoLocation;
@@ -1050,6 +1059,7 @@ static NTSTATUS NTAPI HookNtQueryObject(
                         if(Next <= (ULONG_PTR)pObjInfoLocation || Next > (ULONG_PTR)BufferEnd)
                             break;
                         pObjInfoLocation = (unsigned char*)Next;
+                        ObjectsVisited++;
                     }
                 }
 

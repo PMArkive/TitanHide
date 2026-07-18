@@ -717,6 +717,63 @@ bool CheckObjectTypesInformationOverlapContract()
         }
     }
 
+    // Bytes after the native object-type list are caller-owned even when the
+    // supplied allocation is larger than ReturnLength. A filter must not scan
+    // or modify a crafted entry in that tail.
+    ULONG TailActualLength = 0;
+    Status = NtQO(nullptr,
+                  ObjectTypesInformation,
+                  Buffer,
+                  BufferSize,
+                  &TailActualLength);
+    if(NT_SUCCESS(Status))
+    {
+        All = (OBJECT_ALL_INFORMATION*)Buffer;
+        Location = (unsigned char*)All->ObjectTypeInformation;
+        for(ULONG i = 0; i < All->NumberOfObjects; i++)
+        {
+            OBJECT_TYPE_INFORMATION* Type = (OBJECT_TYPE_INFORMATION*)Location;
+            Location = (unsigned char*)Type->TypeName.Buffer +
+                       Type->TypeName.MaximumLength;
+            Location = (unsigned char*)(((ULONG_PTR)Location + sizeof(void*) - 1) &
+                                        -(LONG_PTR)sizeof(void*));
+        }
+
+        const SIZE_T FakeSize = sizeof(OBJECT_TYPE_INFORMATION) + sizeof(DebugObject);
+        if(Location >= Buffer + TailActualLength &&
+                Location + FakeSize <= Buffer + BufferSize)
+        {
+            OBJECT_TYPE_INFORMATION* Fake =
+                (OBJECT_TYPE_INFORMATION*)Location;
+            memset(Fake, 0, FakeSize);
+            Fake->TypeName.Buffer = (PWSTR)(Fake + 1);
+            Fake->TypeName.Length = DebugObjectLength;
+            Fake->TypeName.MaximumLength = sizeof(DebugObject);
+            Fake->TotalNumberOfObjects = 0xA1B2C3D4;
+            Fake->TotalNumberOfHandles = 0xB1C2D3E4;
+            memcpy(Fake->TypeName.Buffer, DebugObject, sizeof(DebugObject));
+
+            unsigned char Expected[sizeof(OBJECT_TYPE_INFORMATION) + sizeof(DebugObject)];
+            memcpy(Expected, Fake, sizeof(Expected));
+            Status = NtQO(nullptr,
+                          ObjectTypesInformation,
+                          Buffer,
+                          BufferSize,
+                          &TailActualLength);
+            if(!NT_SUCCESS(Status) ||
+                    memcmp(Fake, Expected, sizeof(Expected)) != 0)
+            {
+                printf("ObjectTypesInformation tail contract mismatch: %08X\n", Status);
+                Detected = true;
+            }
+        }
+    }
+    else
+    {
+        printf("ObjectTypesInformation tail setup failed: %08X\n", Status);
+        Detected = true;
+    }
+
     HeapFree(GetProcessHeap(), 0, Buffer);
     return Detected;
 }
