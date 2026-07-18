@@ -513,41 +513,105 @@ struct DEBUG_OBJECT_CONTRIBUTION
     ULONG Handles;
 };
 
+struct SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX_LOCAL
+{
+    PVOID Object;
+    ULONG_PTR UniqueProcessId;
+    ULONG_PTR HandleValue;
+    ULONG GrantedAccess;
+    USHORT CreatorBackTraceIndex;
+    USHORT ObjectTypeIndex;
+    ULONG HandleAttributes;
+    ULONG Reserved;
+};
+
+struct SYSTEM_HANDLE_INFORMATION_EX_LOCAL
+{
+    ULONG_PTR NumberOfHandles;
+    ULONG_PTR Reserved;
+    SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX_LOCAL Handles[1];
+};
+
 static bool QueryDebugObjectContribution(DEBUG_OBJECT_CONTRIBUTION* Contribution)
 {
     Contribution->Objects = 0;
     Contribution->Handles = 0;
 
-    HANDLE DebugObjectHandle = nullptr;
-    NTSTATUS Status = Undocumented::ZwQueryInformationProcess(
-                          NtCurrentProcess(),
-                          ProcessDebugObjectHandle,
-                          &DebugObjectHandle,
-                          sizeof(DebugObjectHandle),
-                          nullptr);
-    if(!NT_SUCCESS(Status) || DebugObjectHandle == nullptr)
+    // The process has one active debug-port object at most. Do not query
+    // ProcessDebugObjectHandle here: repeatedly opening that handle can retain
+    // references to the DebugObject after both debugger and debuggee exit.
+    PVOID DebugPort = PsGetProcessDebugPort(PsGetCurrentProcess());
+    if(DebugPort == nullptr)
         return false;
 
-    PUBLIC_OBJECT_BASIC_INFORMATION BasicInformation = {};
-    Status = ZwQueryObject(
-                 DebugObjectHandle,
-                 ObjectBasicInformation,
-                 &BasicInformation,
-                 sizeof(BasicInformation),
-                 nullptr);
-    ObCloseHandle(DebugObjectHandle, KernelMode);
-    if(!NT_SUCCESS(Status))
+    ULONG BufferSize = 0;
+    NTSTATUS Status = Undocumented::ZwQuerySystemInformation(
+                          SystemExtendedHandleInformation,
+                          nullptr,
+                          0,
+                          &BufferSize);
+    if(Status != STATUS_INFO_LENGTH_MISMATCH || BufferSize == 0)
         return false;
 
-    Contribution->Objects = 1;
+    constexpr ULONG MaximumBufferSize = 64 * 1024 * 1024;
+    for(ULONG Attempt = 0; Attempt < 4; Attempt++)
+    {
+        if(BufferSize > MaximumBufferSize || BufferSize > MAXULONG - PAGE_SIZE)
+            return false;
+        BufferSize += PAGE_SIZE;
 
-    // ProcessDebugObjectHandle opened the temporary handle queried above. Remove
-    // it from the per-object count to obtain the active debug object's actual
-    // contribution to the system-wide DebugObject handle total.
-    if(BasicInformation.HandleCount != 0)
-        Contribution->Handles = BasicInformation.HandleCount - 1;
+        SYSTEM_HANDLE_INFORMATION_EX_LOCAL* HandleInformation =
+            (SYSTEM_HANDLE_INFORMATION_EX_LOCAL*)ExAllocatePoolWithTag(
+                PagedPool,
+                BufferSize,
+                'hDbT');
+        if(HandleInformation == nullptr)
+            return false;
 
-    return true;
+        ULONG RequiredSize = 0;
+        Status = Undocumented::ZwQuerySystemInformation(
+                     SystemExtendedHandleInformation,
+                     HandleInformation,
+                     BufferSize,
+                     &RequiredSize);
+        if(Status == STATUS_INFO_LENGTH_MISMATCH)
+        {
+            ExFreePoolWithTag(HandleInformation, 'hDbT');
+            BufferSize = RequiredSize > BufferSize ? RequiredSize : BufferSize;
+            continue;
+        }
+        if(!NT_SUCCESS(Status))
+        {
+            ExFreePoolWithTag(HandleInformation, 'hDbT');
+            return false;
+        }
+
+        const SIZE_T HeaderSize = FIELD_OFFSET(SYSTEM_HANDLE_INFORMATION_EX_LOCAL, Handles);
+        const ULONG_PTR MaximumEntries =
+            BufferSize >= HeaderSize
+            ? (BufferSize - HeaderSize) / sizeof(SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX_LOCAL)
+            : 0;
+        if(HandleInformation->NumberOfHandles > MaximumEntries)
+        {
+            ExFreePoolWithTag(HandleInformation, 'hDbT');
+            return false;
+        }
+
+        Contribution->Objects = 1;
+        for(ULONG_PTR i = 0; i < HandleInformation->NumberOfHandles; i++)
+        {
+            if(HandleInformation->Handles[i].Object == DebugPort &&
+                    Contribution->Handles != MAXULONG)
+            {
+                Contribution->Handles++;
+            }
+        }
+
+        ExFreePoolWithTag(HandleInformation, 'hDbT');
+        return true;
+    }
+
+    return false;
 }
 
 static void RemoveDebugObjectContribution(
