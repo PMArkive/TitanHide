@@ -193,9 +193,8 @@ Exit:
     return Status;
 }
 
-// The NtQueryInformationThread hook prevents a process from enabling ThreadHideFromDebugger on
-// new threads, but there is no kernel API to disable this flag on threads that already have it.
-// This function uses DKOM to strip the HideFromDebugger flag from all threads in a process.
+// Reapply a preexisting flag only as immediate rollback when a DKOM clear
+// cannot be virtualized. Intercepted set/create requests never call this.
 VOID RestoreHideFromDebugger(_In_ PETHREAD Thread)
 {
     if(CrossThreadFlagsOffset != 0)
@@ -205,6 +204,8 @@ VOID RestoreHideFromDebugger(_In_ PETHREAD Thread)
     }
 }
 
+// There is no kernel API to clear HideFromDebugger on threads that already
+// have it, so use DKOM and preserve its observable query state virtually.
 NTSTATUS UndoHideFromDebuggerInRunningThreads(_In_ ULONG Pid)
 {
     PSYSTEM_PROCESS_INFORMATION SystemProcessInfo = nullptr, Entry;
