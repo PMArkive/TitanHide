@@ -89,7 +89,7 @@ static void RemoveVirtualThreadHide(HANDLE ProcessId, HANDLE ThreadId)
         ObDereferenceObject(Thread);
 }
 
-static bool RegisterVirtualThreadHide(PETHREAD Thread)
+bool Hooks::RegisterVirtualThreadHide(PETHREAD Thread)
 {
     VIRTUAL_THREAD_HIDE_ENTRY Entry;
     Entry.ProcessId = PsGetProcessId(PsGetThreadProcess(Thread));
@@ -275,7 +275,7 @@ static NTSTATUS NTAPI HookNtSetInformationThread(
                               NULL);
             if(NT_SUCCESS(status))
             {
-                const bool Registered = RegisterVirtualThreadHide(Thread);
+                const bool Registered = Hooks::RegisterVirtualThreadHide(Thread);
                 ObDereferenceObject(Thread);
                 if(!Registered)
                     return Undocumented::NtSetInformationThread(

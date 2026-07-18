@@ -1,5 +1,6 @@
 #include "threadhidefromdbg.h"
 #include "undocumented.h"
+#include "hooks.h"
 #include "log.h"
 
 // Exclude false positive matches in the KTHREAD/Tcb header
@@ -240,9 +241,18 @@ NTSTATUS UndoHideFromDebuggerInRunningThreads(_In_ ULONG Pid)
                     LONG* CrossThreadFlagsAddress = (LONG*)((ULONG_PTR)Thread + CrossThreadFlagsOffset);
                     if((InterlockedAnd(CrossThreadFlagsAddress, ~PS_CROSS_THREAD_FLAGS_HIDEFROMDBG) & PS_CROSS_THREAD_FLAGS_HIDEFROMDBG) != 0)
                     {
-                        NumThreadFlagsStripped++;
-                        Log("[TITANHIDE] Stripped ThreadHideFromDebugger flag from PID %u, TID %u!\r\n",
-                            Pid, (ULONG)(ULONG_PTR)Entry->Threads[i].ClientId.UniqueThread);
+                        if(Hooks::RegisterVirtualThreadHide(Thread))
+                        {
+                            NumThreadFlagsStripped++;
+                            Log("[TITANHIDE] Stripped ThreadHideFromDebugger flag from PID %u, TID %u!\r\n",
+                                Pid, (ULONG)(ULONG_PTR)Entry->Threads[i].ClientId.UniqueThread);
+                        }
+                        else
+                        {
+                            // Keep native observable state if virtualization could
+                            // not be registered.
+                            InterlockedOr(CrossThreadFlagsAddress, PS_CROSS_THREAD_FLAGS_HIDEFROMDBG);
+                        }
                     }
                     ObDereferenceObject(Thread);
                 }

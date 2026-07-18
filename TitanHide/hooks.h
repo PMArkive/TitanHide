@@ -8,6 +8,7 @@ class Hooks
 public:
     static int Initialize();
     static void Deinitialize();
+    static bool RegisterVirtualThreadHide(PETHREAD Thread);
 };
 
 #endif
