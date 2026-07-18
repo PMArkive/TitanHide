@@ -213,8 +213,6 @@ NTSTATUS UndoHideFromDebuggerInRunningThreads(_In_ ULONG Pid)
 
     if(CrossThreadFlagsOffset == 0)
         return STATUS_NOT_FOUND;
-    if(!Hooks::IsThreadHideVirtualizationAvailable())
-        return STATUS_NOT_SUPPORTED;
 
     PEPROCESS Process;
     NTSTATUS Status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)Pid, &Process);

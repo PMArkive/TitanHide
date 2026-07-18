@@ -22,15 +22,15 @@ static KMUTEX gDebugPortMutex;
 struct VIRTUAL_THREAD_HIDE_ENTRY
 {
     HANDLE ProcessId;
-    HANDLE ThreadId;
     PETHREAD Thread;
 };
 
+// Retain thread identity so an exited thread queried through an open handle
+// keeps its virtual state. Entries are released on unhide/unload and bounded.
 #define MAX_VIRTUAL_THREAD_HIDE_ENTRIES 4096
 static VIRTUAL_THREAD_HIDE_ENTRY gVirtualThreadHideEntries[MAX_VIRTUAL_THREAD_HIDE_ENTRIES];
 static ULONG gVirtualThreadHideEntryCount = 0;
 static KSPIN_LOCK gVirtualThreadHideLock;
-static bool gThreadNotifyRegistered = false;
 
 //https://forum.tuts4you.com/topic/40011-debugme-vmprotect-312-build-886-anti-debug-method-improved/#comment-192824
 //https://github.com/x64dbg/ScyllaHide/issues/47
@@ -280,45 +280,10 @@ static void InitializeDebugObjectTypeSignature()
     }
 }
 
-static void RemoveVirtualThreadHide(
-    HANDLE ProcessId,
-    HANDLE ThreadId,
-    bool RestoreState)
-{
-    PETHREAD Thread = nullptr;
-    KIRQL Irql;
-    KeAcquireSpinLock(&gVirtualThreadHideLock, &Irql);
-    for(ULONG i = 0; i < gVirtualThreadHideEntryCount; i++)
-    {
-        if(gVirtualThreadHideEntries[i].ProcessId == ProcessId &&
-                gVirtualThreadHideEntries[i].ThreadId == ThreadId)
-        {
-            Thread = gVirtualThreadHideEntries[i].Thread;
-            if(RestoreState)
-                RestoreHideFromDebugger(Thread);
-            gVirtualThreadHideEntries[i] =
-                gVirtualThreadHideEntries[--gVirtualThreadHideEntryCount];
-            break;
-        }
-    }
-    KeReleaseSpinLock(&gVirtualThreadHideLock, Irql);
-    if(Thread != nullptr)
-        ObDereferenceObject(Thread);
-}
-
-bool Hooks::IsThreadHideVirtualizationAvailable()
-{
-    return gThreadNotifyRegistered;
-}
-
 bool Hooks::RegisterVirtualThreadHide(PETHREAD Thread)
 {
-    if(!gThreadNotifyRegistered)
-        return false;
-
     VIRTUAL_THREAD_HIDE_ENTRY Entry;
     Entry.ProcessId = PsGetProcessId(PsGetThreadProcess(Thread));
-    Entry.ThreadId = PsGetThreadId(Thread);
     Entry.Thread = Thread;
 
     KIRQL Irql;
@@ -332,35 +297,49 @@ bool Hooks::RegisterVirtualThreadHide(PETHREAD Thread)
         }
     }
 
-    const bool Registered = gVirtualThreadHideEntryCount < MAX_VIRTUAL_THREAD_HIDE_ENTRIES;
+    // Prefer live-thread coverage when the bounded table is full. Evicting an
+    // exited entry can only affect a surviving handle after deliberate table
+    // exhaustion and never applies the physical one-way flag.
+    PETHREAD EvictedThread = nullptr;
+    if(gVirtualThreadHideEntryCount == MAX_VIRTUAL_THREAD_HIDE_ENTRIES)
+    {
+        for(ULONG i = 0; i < gVirtualThreadHideEntryCount; i++)
+        {
+            if(PsIsThreadTerminating(gVirtualThreadHideEntries[i].Thread))
+            {
+                EvictedThread = gVirtualThreadHideEntries[i].Thread;
+                gVirtualThreadHideEntries[i] =
+                    gVirtualThreadHideEntries[--gVirtualThreadHideEntryCount];
+                break;
+            }
+        }
+    }
+
+    const bool Registered =
+        gVirtualThreadHideEntryCount < MAX_VIRTUAL_THREAD_HIDE_ENTRIES;
     if(Registered)
     {
         ObReferenceObject(Thread);
         gVirtualThreadHideEntries[gVirtualThreadHideEntryCount++] = Entry;
     }
     KeReleaseSpinLock(&gVirtualThreadHideLock, Irql);
+    if(EvictedThread != nullptr)
+        ObDereferenceObject(EvictedThread);
 
-    // If exit notification raced ahead of registration, remove the entry now.
-    if(Registered && PsIsThreadTerminating(Thread))
-    {
-        RestoreHideFromDebugger(Thread);
-        RemoveVirtualThreadHide(Entry.ProcessId, Entry.ThreadId, false);
-        return true;
-    }
-
-    // Unhide can race with a set request. Preserve the native state rather than
-    // leaving an untracked thread with its physical flag cleared.
+    // Unhide can race with registration. Clear the virtual state if protection
+    // ended; never apply a delayed physical HideFromDebugger request.
     if(Registered &&
             !Hider::IsHidden((ULONG)(ULONG_PTR)Entry.ProcessId,
                              HideThreadHideFromDebugger))
     {
-        RestoreHideFromDebugger(Thread);
-        RemoveVirtualThreadHide(Entry.ProcessId, Entry.ThreadId, false);
+        Hooks::ClearVirtualThreadHides(
+            (ULONG)(ULONG_PTR)Entry.ProcessId,
+            false);
     }
     return Registered;
 }
 
-void Hooks::RestoreVirtualThreadHides(ULONG ProcessId, bool AllProcesses)
+void Hooks::ClearVirtualThreadHides(ULONG ProcessId, bool AllProcesses)
 {
     while(true)
     {
@@ -374,8 +353,6 @@ void Hooks::RestoreVirtualThreadHides(ULONG ProcessId, bool AllProcesses)
                         (HANDLE)(ULONG_PTR)ProcessId)
             {
                 Thread = gVirtualThreadHideEntries[i].Thread;
-                if(!PsIsThreadTerminating(Thread))
-                    RestoreHideFromDebugger(Thread);
                 gVirtualThreadHideEntries[i] =
                     gVirtualThreadHideEntries[--gVirtualThreadHideEntryCount];
                 break;
@@ -406,12 +383,6 @@ static bool HasVirtualThreadHide(PETHREAD Thread)
     return Found;
 }
 
-static void ThreadNotifyRoutine(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
-{
-    if(!Create)
-        RemoveVirtualThreadHide(ProcessId, ThreadId, true);
-}
-
 static void RegisterCreatedVirtualThreadHide(PHANDLE ThreadHandle)
 {
     __try
@@ -429,8 +400,9 @@ static void RegisterCreatedVirtualThreadHide(PHANDLE ThreadHandle)
                               nullptr);
         if(NT_SUCCESS(Status))
         {
-            if(!Hooks::RegisterVirtualThreadHide(Thread))
-                RestoreHideFromDebugger(Thread);
+            // Keep the physical flag clear even if the bounded virtual-state
+            // table is exhausted. Debugger visibility takes precedence.
+            Hooks::RegisterVirtualThreadHide(Thread);
             ObDereferenceObject(Thread);
         }
     }
@@ -515,8 +487,7 @@ static NTSTATUS NTAPI HookNtQueryInformationThread(
     NTSTATUS Status = Undocumented::NtQueryInformationThread(ThreadHandle, ThreadInformationClass, ThreadInformation, ThreadInformationLength, ReturnLength);
 
     if(NT_SUCCESS(Status) &&
-            ThreadInformationClass == ThreadHideFromDebugger &&
-            gThreadNotifyRegistered)
+            ThreadInformationClass == ThreadHideFromDebugger)
     {
         __try
         {
@@ -570,8 +541,7 @@ static NTSTATUS NTAPI HookNtSetInformationThread(
     //Bug found by Aguila, thanks!
     if(ThreadInformationClass == ThreadHideFromDebugger && !ThreadInformationLength)
     {
-        if(gThreadNotifyRegistered &&
-                Hider::IsHidden(pid, HideThreadHideFromDebugger) &&
+        if(Hider::IsHidden(pid, HideThreadHideFromDebugger) &&
                 Hider::IsHidden(targetPid, HideThreadHideFromDebugger))
         {
             Log("[TITANHIDE] NtSetInformationThread(ThreadHideFromDebugger) by %d\r\n", pid);
@@ -584,14 +554,10 @@ static NTSTATUS NTAPI HookNtSetInformationThread(
                               NULL);
             if(NT_SUCCESS(status))
             {
-                const bool Registered = Hooks::RegisterVirtualThreadHide(Thread);
+                // Never fall back to the real set operation: the flag is
+                // one-way and would hide this thread from the debugger.
+                Hooks::RegisterVirtualThreadHide(Thread);
                 ObDereferenceObject(Thread);
-                if(!Registered)
-                    return Undocumented::NtSetInformationThread(
-                               ThreadHandle,
-                               ThreadInformationClass,
-                               ThreadInformation,
-                               ThreadInformationLength);
             }
             return status;
         }
@@ -1361,7 +1327,6 @@ static NTSTATUS NTAPI HookNtCreateThreadEx(
     const ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
     const ULONG targetPid = Misc::GetProcessIDFromProcessHandle(ProcessHandle);
     const bool VirtualizeThreadHide =
-        gThreadNotifyRegistered &&
         (CreateFlags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER) != 0 &&
         Hider::IsHidden(pid, HideThreadHideFromDebugger) &&
         Hider::IsHidden(targetPid, HideThreadHideFromDebugger);
@@ -1394,7 +1359,6 @@ int Hooks::Initialize()
     KeInitializeMutex(&gDebugPortMutex, 0);
     KeInitializeSpinLock(&gVirtualThreadHideLock);
     gVirtualThreadHideEntryCount = 0;
-    gThreadNotifyRegistered = NT_SUCCESS(PsSetCreateThreadNotifyRoutine(ThreadNotifyRoutine));
 
     int hook_count = 0;
     hNtQueryInformationProcess = SSDT::Hook("NtQueryInformationProcess", (void*)HookNtQueryInformationProcess);
@@ -1453,11 +1417,5 @@ void Hooks::Deinitialize()
         SSDT::Unhook(hNtCreateThreadEx, true);
     }
 
-    if(gThreadNotifyRegistered)
-    {
-        PsRemoveCreateThreadNotifyRoutine(ThreadNotifyRoutine);
-        gThreadNotifyRegistered = false;
-    }
-
-    RestoreVirtualThreadHides(0, true);
+    ClearVirtualThreadHides(0, true);
 }

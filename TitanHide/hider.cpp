@@ -145,7 +145,7 @@ bool Hider::ProcessData(PVOID Buffer, ULONG Size)
             }
             KeReleaseSpinLock(&HideEntriesLock, Irql);
             if((HideInfo[i].Type & (ULONG)HideThreadHideFromDebugger) != 0)
-                Hooks::RestoreVirtualThreadHides(HideInfo[i].Pid, false);
+                Hooks::ClearVirtualThreadHides(HideInfo[i].Pid, false);
         }
         break;
 
@@ -155,7 +155,7 @@ bool Hider::ProcessData(PVOID Buffer, ULONG Size)
             KeAcquireSpinLock(&HideEntriesLock, &Irql);
             EntryClear();
             KeReleaseSpinLock(&HideEntriesLock, Irql);
-            Hooks::RestoreVirtualThreadHides(0, true);
+            Hooks::ClearVirtualThreadHides(0, true);
         }
         break;
         }
