@@ -247,6 +247,94 @@ bool HideFromDebugger()
                             0));
 }
 
+static DWORD WINAPI ContractThreadProc(PVOID)
+{
+    return 0;
+}
+
+bool CheckThreadHideFromDebuggerContract()
+{
+    typedef NTSTATUS(NTAPI * NT_QUERY_INFORMATION_THREAD)(
+        HANDLE, ULONG, PVOID, ULONG, PULONG);
+    typedef NTSTATUS(NTAPI * NT_SET_INFORMATION_THREAD)(
+        HANDLE, ULONG, PVOID, ULONG);
+
+    NT_QUERY_INFORMATION_THREAD NtQIT = (NT_QUERY_INFORMATION_THREAD)
+            GetProcAddress(GetModuleHandle(TEXT("ntdll.dll")), "NtQueryInformationThread");
+    NT_SET_INFORMATION_THREAD NtSIT = (NT_SET_INFORMATION_THREAD)
+            GetProcAddress(GetModuleHandle(TEXT("ntdll.dll")), "NtSetInformationThread");
+    if(NtQIT == nullptr || NtSIT == nullptr)
+        return false;
+
+    HANDLE Thread = CreateThread(nullptr, 0, ContractThreadProc, nullptr, CREATE_SUSPENDED, nullptr);
+    if(Thread == nullptr)
+        return false;
+
+    bool Detected = false;
+    BOOLEAN Hidden = TRUE;
+    ULONG ReturnLength = 0;
+    NTSTATUS Status = NtQIT(Thread, 0x11, &Hidden, sizeof(Hidden), &ReturnLength);
+    if(!NT_SUCCESS(Status) || Hidden != FALSE || ReturnLength != sizeof(Hidden))
+    {
+        printf("ThreadHideFromDebugger initial-state mismatch: %08X, %u, %u\n",
+               Status, Hidden, ReturnLength);
+        Detected = true;
+    }
+
+    Status = NtSIT(Thread, 0x11, nullptr, 0);
+    if(!NT_SUCCESS(Status))
+    {
+        printf("ThreadHideFromDebugger set failed: %08X\n", Status);
+        Detected = true;
+    }
+
+    Hidden = FALSE;
+    ReturnLength = 0;
+    Status = NtQIT(Thread, 0x11, &Hidden, sizeof(Hidden), &ReturnLength);
+    if(!NT_SUCCESS(Status) || Hidden != TRUE || ReturnLength != sizeof(Hidden))
+    {
+        printf("ThreadHideFromDebugger virtual-state mismatch: %08X, %u, %u\n",
+               Status, Hidden, ReturnLength);
+        Detected = true;
+    }
+
+    TerminateThread(Thread, 0);
+    CloseHandle(Thread);
+    return Detected;
+}
+
+bool CheckGetContextFailureContract()
+{
+    typedef NTSTATUS(NTAPI * NT_GET_CONTEXT_THREAD)(HANDLE, PCONTEXT);
+    NT_GET_CONTEXT_THREAD NtGCT = (NT_GET_CONTEXT_THREAD)
+            GetProcAddress(GetModuleHandle(TEXT("ntdll.dll")), "NtGetContextThread");
+    if(NtGCT == nullptr)
+        return false;
+
+    HANDLE LimitedThread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION,
+                                      FALSE,
+                                      GetCurrentThreadId());
+    if(LimitedThread == nullptr)
+        return false;
+
+    __declspec(align(16)) CONTEXT Context;
+    memset(&Context, 0xA5, sizeof(Context));
+    Context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    CONTEXT OriginalContext;
+    memcpy(&OriginalContext, &Context, sizeof(Context));
+
+    NTSTATUS Status = NtGCT(LimitedThread, &Context);
+    CloseHandle(LimitedThread);
+
+    const NTSTATUS StatusAccessDenied = (NTSTATUS)0xC0000022L;
+    if(Status != StatusAccessDenied || memcmp(&Context, &OriginalContext, sizeof(Context)) != 0)
+    {
+        printf("NtGetContextThread failure contract mismatch: %08X\n", Status);
+        return true;
+    }
+    return false;
+}
+
 typedef struct _OBJECT_TYPE_INFORMATION
 {
     UNICODE_STRING TypeName;
@@ -469,6 +557,71 @@ bool CheckObjectList()
     }
 }
 
+bool CheckObjectTypesInformationOverlapContract()
+{
+    typedef NTSTATUS(NTAPI * pNtQueryObject)(
+        HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+    pNtQueryObject NtQO = (pNtQueryObject)GetProcAddress(
+                              GetModuleHandle(TEXT("ntdll.dll")),
+                              "NtQueryObject");
+    if(NtQO == nullptr)
+        return false;
+
+    ULONG Size = 0;
+    NTSTATUS Status = NtQO(nullptr, ObjectTypesInformation, nullptr, 0, &Size);
+    if(Status != (NTSTATUS)0xC0000004L || Size == 0)
+        return false;
+
+    const ULONG BufferSize = Size + 0x10000;
+    unsigned char* Buffer = (unsigned char*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, BufferSize);
+    if(Buffer == nullptr)
+        return false;
+
+    ULONG ActualLength = 0;
+    Status = NtQO(nullptr, ObjectTypesInformation, Buffer, BufferSize, &ActualLength);
+    if(!NT_SUCCESS(Status))
+    {
+        printf("ObjectTypesInformation baseline query failed: %08X\n", Status);
+        HeapFree(GetProcessHeap(), 0, Buffer);
+        return true;
+    }
+
+    OBJECT_ALL_INFORMATION* All = (OBJECT_ALL_INFORMATION*)Buffer;
+    unsigned char* Location = (unsigned char*)All->ObjectTypeInformation;
+    PULONG Overlap = nullptr;
+    const wchar_t DebugObject[] = L"DebugObject";
+    const USHORT DebugObjectLength = sizeof(DebugObject) - sizeof(wchar_t);
+    for(ULONG i = 0; i < All->NumberOfObjects; i++)
+    {
+        OBJECT_TYPE_INFORMATION* Type = (OBJECT_TYPE_INFORMATION*)Location;
+        if(Type->TypeName.Length == DebugObjectLength &&
+                memcmp(Type->TypeName.Buffer, DebugObject, DebugObjectLength) == 0)
+        {
+            Overlap = (PULONG)&Type->TypeName.Buffer;
+            break;
+        }
+        Location = (unsigned char*)Type->TypeName.Buffer + Type->TypeName.MaximumLength;
+        Location = (unsigned char*)(((ULONG_PTR)Location + sizeof(void*) - 1) &
+                                    -(LONG_PTR)sizeof(void*));
+    }
+
+    bool Detected = Overlap == nullptr;
+    if(Overlap == nullptr)
+        puts("ObjectTypesInformation did not contain DebugObject");
+    if(Overlap != nullptr)
+    {
+        Status = NtQO(nullptr, ObjectTypesInformation, Buffer, BufferSize, Overlap);
+        if(!NT_SUCCESS(Status) || *Overlap != ActualLength)
+        {
+            printf("ObjectTypesInformation overlap contract mismatch: %08X\n", Status);
+            Detected = true;
+        }
+    }
+
+    HeapFree(GetProcessHeap(), 0, Buffer);
+    return Detected;
+}
+
 enum PROCESSINFOCLASS
 {
     ProcessBasicInformation = 0, // 0, q: PROCESS_BASIC_INFORMATION, PROCESS_EXTENDED_BASIC_INFORMATION
@@ -605,8 +758,16 @@ bool CheckNtClose()
 
 int main(int argc, char* argv[])
 {
-    if(argc == 2 && strcmp(argv[1], "--process-debug-object-contract") == 0)
-        return CheckProcessDebugObjectHandle() ? 1 : 0;
+    if(argc == 2 && strcmp(argv[1], "--native-contracts") == 0)
+    {
+        const bool ProcessDebugObject = CheckProcessDebugObjectHandle();
+        const bool ThreadHide = CheckThreadHideFromDebuggerContract();
+        const bool GetContextFailure = CheckGetContextFailureContract();
+        const bool ObjectTypesOverlap = CheckObjectTypesInformationOverlapContract();
+        printf("Native contracts: ProcessDebugObject=%d ThreadHide=%d GetContextFailure=%d ObjectTypesOverlap=%d\n",
+               ProcessDebugObject, ThreadHide, GetContextFailure, ObjectTypesOverlap);
+        return ProcessDebugObject || ThreadHide || GetContextFailure || ObjectTypesOverlap ? 1 : 0;
+    }
 
     char title[256] = "";
     sprintf_s(title, "pid: %d", (int)GetCurrentProcessId());
