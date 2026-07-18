@@ -304,6 +304,16 @@ bool CheckThreadHideFromDebuggerContract()
     }
 
     TerminateThread(Thread, 0);
+    WaitForSingleObject(Thread, INFINITE);
+    Hidden = FALSE;
+    ReturnLength = 0;
+    Status = NtQIT(Thread, 0x11, &Hidden, sizeof(Hidden), &ReturnLength);
+    if(!NT_SUCCESS(Status) || Hidden != TRUE || ReturnLength != sizeof(Hidden))
+    {
+        printf("Exited ThreadHideFromDebugger state mismatch: %08X, %u, %u\n",
+               Status, Hidden, ReturnLength);
+        Detected = true;
+    }
     CloseHandle(Thread);
 
     // A thread created with the hide flag has the same observable state as one

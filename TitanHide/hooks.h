@@ -9,6 +9,7 @@ public:
     static int Initialize();
     static void Deinitialize();
     static bool RegisterVirtualThreadHide(PETHREAD Thread);
+    static bool IsThreadHideVirtualizationAvailable();
     static void RestoreVirtualThreadHides(ULONG ProcessId, bool AllProcesses);
 };
 

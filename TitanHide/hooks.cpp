@@ -280,7 +280,10 @@ static void InitializeDebugObjectTypeSignature()
     }
 }
 
-static void RemoveVirtualThreadHide(HANDLE ProcessId, HANDLE ThreadId)
+static void RemoveVirtualThreadHide(
+    HANDLE ProcessId,
+    HANDLE ThreadId,
+    bool RestoreState)
 {
     PETHREAD Thread = nullptr;
     KIRQL Irql;
@@ -291,6 +294,8 @@ static void RemoveVirtualThreadHide(HANDLE ProcessId, HANDLE ThreadId)
                 gVirtualThreadHideEntries[i].ThreadId == ThreadId)
         {
             Thread = gVirtualThreadHideEntries[i].Thread;
+            if(RestoreState)
+                RestoreHideFromDebugger(Thread);
             gVirtualThreadHideEntries[i] =
                 gVirtualThreadHideEntries[--gVirtualThreadHideEntryCount];
             break;
@@ -301,8 +306,16 @@ static void RemoveVirtualThreadHide(HANDLE ProcessId, HANDLE ThreadId)
         ObDereferenceObject(Thread);
 }
 
+bool Hooks::IsThreadHideVirtualizationAvailable()
+{
+    return gThreadNotifyRegistered;
+}
+
 bool Hooks::RegisterVirtualThreadHide(PETHREAD Thread)
 {
+    if(!gThreadNotifyRegistered)
+        return false;
+
     VIRTUAL_THREAD_HIDE_ENTRY Entry;
     Entry.ProcessId = PsGetProcessId(PsGetThreadProcess(Thread));
     Entry.ThreadId = PsGetThreadId(Thread);
@@ -330,8 +343,9 @@ bool Hooks::RegisterVirtualThreadHide(PETHREAD Thread)
     // If exit notification raced ahead of registration, remove the entry now.
     if(Registered && PsIsThreadTerminating(Thread))
     {
-        RemoveVirtualThreadHide(Entry.ProcessId, Entry.ThreadId);
-        return false;
+        RestoreHideFromDebugger(Thread);
+        RemoveVirtualThreadHide(Entry.ProcessId, Entry.ThreadId, false);
+        return true;
     }
 
     // Unhide can race with a set request. Preserve the native state rather than
@@ -341,7 +355,7 @@ bool Hooks::RegisterVirtualThreadHide(PETHREAD Thread)
                              HideThreadHideFromDebugger))
     {
         RestoreHideFromDebugger(Thread);
-        RemoveVirtualThreadHide(Entry.ProcessId, Entry.ThreadId);
+        RemoveVirtualThreadHide(Entry.ProcessId, Entry.ThreadId, false);
     }
     return Registered;
 }
@@ -395,7 +409,7 @@ static bool HasVirtualThreadHide(PETHREAD Thread)
 static void ThreadNotifyRoutine(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Create)
 {
     if(!Create)
-        RemoveVirtualThreadHide(ProcessId, ThreadId);
+        RemoveVirtualThreadHide(ProcessId, ThreadId, true);
 }
 
 static void RegisterCreatedVirtualThreadHide(PHANDLE ThreadHandle)
