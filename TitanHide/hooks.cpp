@@ -2,6 +2,7 @@
 #include "undocumented.h"
 #include "ssdt.h"
 #include "hider.h"
+#include "threadhidefromdbg.h"
 #include "misc.h"
 #include "log.h"
 
@@ -48,24 +49,235 @@ static bool gThreadNotifyRegistered = false;
 
 #define OBJ_PROTECT_CLOSE 0x00000001L
 
+static bool RangesOverlap(
+    const void* First,
+    SIZE_T FirstSize,
+    const void* Second,
+    SIZE_T SecondSize)
+{
+    if(First == nullptr || Second == nullptr)
+        return false;
+
+    const ULONG_PTR FirstAddress = (ULONG_PTR)First;
+    const ULONG_PTR SecondAddress = (ULONG_PTR)Second;
+    if(FirstAddress <= SecondAddress)
+        return SecondAddress - FirstAddress < FirstSize;
+    return FirstAddress - SecondAddress < SecondSize;
+}
+
+struct DEBUG_OBJECT_TYPE_SIGNATURE
+{
+    ULONG InvalidAttributes;
+    GENERIC_MAPPING GenericMapping;
+    ULONG ValidAccessMask;
+    BOOLEAN SecurityRequired;
+    BOOLEAN MaintainHandleCount;
+    UCHAR TypeIndex;
+    ULONG PoolType;
+    ULONG DefaultPagedPoolCharge;
+    ULONG DefaultNonPagedPoolCharge;
+};
+
+static DEBUG_OBJECT_TYPE_SIGNATURE gDebugObjectTypeSignature = {};
+static bool gDebugObjectTypeSignatureValid = false;
+
+static bool TypeFieldMatches(
+    const void* Field,
+    const void* Expected,
+    SIZE_T Size,
+    PULONG ReturnLength)
+{
+    return RangesOverlap(Field, Size, ReturnLength, sizeof(ULONG)) ||
+           RtlCompareMemory(Field, Expected, Size) == Size;
+}
+
+static bool IsDebugObjectTypeDescriptor(
+    const OBJECT_TYPE_INFORMATION* TypeInformation,
+    PULONG ReturnLength,
+    const DEBUG_OBJECT_TYPE_SIGNATURE* Signature)
+{
+    if(!gDebugObjectTypeSignatureValid)
+        return false;
+
+    return TypeFieldMatches(&TypeInformation->InvalidAttributes,
+                            &Signature->InvalidAttributes,
+                            sizeof(Signature->InvalidAttributes),
+                            ReturnLength) &&
+           TypeFieldMatches(&TypeInformation->GenericMapping,
+                            &Signature->GenericMapping,
+                            sizeof(Signature->GenericMapping),
+                            ReturnLength) &&
+           TypeFieldMatches(&TypeInformation->ValidAccessMask,
+                            &Signature->ValidAccessMask,
+                            sizeof(Signature->ValidAccessMask),
+                            ReturnLength) &&
+           TypeFieldMatches(&TypeInformation->SecurityRequired,
+                            &Signature->SecurityRequired,
+                            sizeof(Signature->SecurityRequired),
+                            ReturnLength) &&
+           TypeFieldMatches(&TypeInformation->MaintainHandleCount,
+                            &Signature->MaintainHandleCount,
+                            sizeof(Signature->MaintainHandleCount),
+                            ReturnLength) &&
+           TypeFieldMatches(&TypeInformation->TypeIndex,
+                            &Signature->TypeIndex,
+                            sizeof(Signature->TypeIndex),
+                            ReturnLength) &&
+           TypeFieldMatches(&TypeInformation->PoolType,
+                            &Signature->PoolType,
+                            sizeof(Signature->PoolType),
+                            ReturnLength) &&
+           TypeFieldMatches(&TypeInformation->DefaultPagedPoolCharge,
+                            &Signature->DefaultPagedPoolCharge,
+                            sizeof(Signature->DefaultPagedPoolCharge),
+                            ReturnLength) &&
+           TypeFieldMatches(&TypeInformation->DefaultNonPagedPoolCharge,
+                            &Signature->DefaultNonPagedPoolCharge,
+                            sizeof(Signature->DefaultNonPagedPoolCharge),
+                            ReturnLength);
+}
+
 static bool IsDebugObjectTypeInformation(
     OBJECT_TYPE_INFORMATION* TypeInformation,
     ULONG ObjectInformationLength,
-    const UNICODE_STRING* DebugObject)
+    PULONG ReturnLength,
+    const UNICODE_STRING* DebugObject,
+    const DEBUG_OBJECT_TYPE_SIGNATURE* Signature)
 {
-    if(ObjectInformationLength < sizeof(OBJECT_TYPE_INFORMATION) + DebugObject->Length)
+    if(ObjectInformationLength < sizeof(OBJECT_TYPE_INFORMATION))
         return false;
 
     ProbeForRead(TypeInformation, sizeof(OBJECT_TYPE_INFORMATION), 1);
-    if(TypeInformation->TypeName.Length != DebugObject->Length)
+    if(IsDebugObjectTypeDescriptor(TypeInformation, ReturnLength, Signature))
+        return true;
+
+    if(ObjectInformationLength < sizeof(OBJECT_TYPE_INFORMATION) + DebugObject->Length ||
+            TypeInformation->TypeName.Length != DebugObject->Length)
+    {
         return false;
+    }
 
     // NtQueryObject stores the type name directly after the fixed-size structure.
     // Do not use TypeName.Buffer here: ReturnLength is written last by the kernel
     // and callers may deliberately overlap it with that pointer.
     WCHAR* InlineTypeName = (WCHAR*)(TypeInformation + 1);
+    if(RangesOverlap(InlineTypeName, DebugObject->Length, ReturnLength, sizeof(ULONG)))
+        return false;
     ProbeForRead(InlineTypeName, DebugObject->Length, 1);
     return RtlCompareMemory(InlineTypeName, DebugObject->Buffer, DebugObject->Length) == DebugObject->Length;
+}
+
+static void InitializeDebugObjectTypeSignature()
+{
+    gDebugObjectTypeSignatureValid = false;
+    RtlZeroMemory(&gDebugObjectTypeSignature,
+                  sizeof(gDebugObjectTypeSignature));
+
+    ULONG BufferSize = 0;
+    NTSTATUS Status = ZwQueryObject(
+                          nullptr,
+                          (OBJECT_INFORMATION_CLASS)ObjectTypesInformation,
+                          nullptr,
+                          0,
+                          &BufferSize);
+    if(Status != STATUS_INFO_LENGTH_MISMATCH || BufferSize == 0)
+        return;
+
+    constexpr ULONG MaximumBufferSize = 1024 * 1024;
+    for(ULONG Attempt = 0; Attempt < 4; Attempt++)
+    {
+        if(BufferSize > MaximumBufferSize || BufferSize > MAXULONG - PAGE_SIZE)
+            return;
+        BufferSize += PAGE_SIZE;
+
+        OBJECT_ALL_INFORMATION* AllInformation =
+            (OBJECT_ALL_INFORMATION*)ExAllocatePoolWithTag(
+                PagedPool,
+                BufferSize,
+                'tObT');
+        if(AllInformation == nullptr)
+            return;
+
+        ULONG RequiredSize = 0;
+        Status = ZwQueryObject(
+                     nullptr,
+                     (OBJECT_INFORMATION_CLASS)ObjectTypesInformation,
+                     AllInformation,
+                     BufferSize,
+                     &RequiredSize);
+        if(Status == STATUS_INFO_LENGTH_MISMATCH)
+        {
+            ExFreePoolWithTag(AllInformation, 'tObT');
+            BufferSize = RequiredSize > BufferSize ? RequiredSize : BufferSize;
+            continue;
+        }
+        if(!NT_SUCCESS(Status))
+        {
+            ExFreePoolWithTag(AllInformation, 'tObT');
+            return;
+        }
+
+        const UNICODE_STRING DebugObject = RTL_CONSTANT_STRING(L"DebugObject");
+        unsigned char* BufferStart = (unsigned char*)AllInformation;
+        unsigned char* BufferEnd = BufferStart + BufferSize;
+        unsigned char* Location =
+            (unsigned char*)AllInformation->ObjectTypeInformation;
+        for(ULONG i = 0; i < AllInformation->NumberOfObjects; i++)
+        {
+            if(Location > BufferEnd ||
+                    (SIZE_T)(BufferEnd - Location) < sizeof(OBJECT_TYPE_INFORMATION))
+            {
+                break;
+            }
+
+            OBJECT_TYPE_INFORMATION* TypeInformation =
+                (OBJECT_TYPE_INFORMATION*)Location;
+            unsigned char* Name = (unsigned char*)TypeInformation->TypeName.Buffer;
+            if(Name < BufferStart || Name > BufferEnd ||
+                    TypeInformation->TypeName.Length > (SIZE_T)(BufferEnd - Name) ||
+                    TypeInformation->TypeName.MaximumLength >
+                        (SIZE_T)(BufferEnd - Name))
+            {
+                break;
+            }
+
+            if(RtlEqualUnicodeString(&TypeInformation->TypeName,
+                                     &DebugObject,
+                                     FALSE))
+            {
+                gDebugObjectTypeSignature.InvalidAttributes =
+                    TypeInformation->InvalidAttributes;
+                gDebugObjectTypeSignature.GenericMapping =
+                    TypeInformation->GenericMapping;
+                gDebugObjectTypeSignature.ValidAccessMask =
+                    TypeInformation->ValidAccessMask;
+                gDebugObjectTypeSignature.SecurityRequired =
+                    TypeInformation->SecurityRequired;
+                gDebugObjectTypeSignature.MaintainHandleCount =
+                    TypeInformation->MaintainHandleCount;
+                gDebugObjectTypeSignature.TypeIndex =
+                    TypeInformation->TypeIndex;
+                gDebugObjectTypeSignature.PoolType =
+                    TypeInformation->PoolType;
+                gDebugObjectTypeSignature.DefaultPagedPoolCharge =
+                    TypeInformation->DefaultPagedPoolCharge;
+                gDebugObjectTypeSignature.DefaultNonPagedPoolCharge =
+                    TypeInformation->DefaultNonPagedPoolCharge;
+                gDebugObjectTypeSignatureValid = true;
+                break;
+            }
+
+            ULONG_PTR Next = (ULONG_PTR)Name +
+                             TypeInformation->TypeName.MaximumLength;
+            Next = (Next + sizeof(void*) - 1) & -(LONG_PTR)sizeof(void*);
+            if(Next <= (ULONG_PTR)Location || Next > (ULONG_PTR)BufferEnd)
+                break;
+            Location = (unsigned char*)Next;
+        }
+
+        ExFreePoolWithTag(AllInformation, 'tObT');
+        return;
+    }
 }
 
 static void RemoveVirtualThreadHide(HANDLE ProcessId, HANDLE ThreadId)
@@ -121,7 +333,46 @@ bool Hooks::RegisterVirtualThreadHide(PETHREAD Thread)
         RemoveVirtualThreadHide(Entry.ProcessId, Entry.ThreadId);
         return false;
     }
+
+    // Unhide can race with a set request. Preserve the native state rather than
+    // leaving an untracked thread with its physical flag cleared.
+    if(Registered &&
+            !Hider::IsHidden((ULONG)(ULONG_PTR)Entry.ProcessId,
+                             HideThreadHideFromDebugger))
+    {
+        RestoreHideFromDebugger(Thread);
+        RemoveVirtualThreadHide(Entry.ProcessId, Entry.ThreadId);
+    }
     return Registered;
+}
+
+void Hooks::RestoreVirtualThreadHides(ULONG ProcessId, bool AllProcesses)
+{
+    while(true)
+    {
+        PETHREAD Thread = nullptr;
+        KIRQL Irql;
+        KeAcquireSpinLock(&gVirtualThreadHideLock, &Irql);
+        for(ULONG i = 0; i < gVirtualThreadHideEntryCount; i++)
+        {
+            if(AllProcesses ||
+                    gVirtualThreadHideEntries[i].ProcessId ==
+                        (HANDLE)(ULONG_PTR)ProcessId)
+            {
+                Thread = gVirtualThreadHideEntries[i].Thread;
+                if(!PsIsThreadTerminating(Thread))
+                    RestoreHideFromDebugger(Thread);
+                gVirtualThreadHideEntries[i] =
+                    gVirtualThreadHideEntries[--gVirtualThreadHideEntryCount];
+                break;
+            }
+        }
+        KeReleaseSpinLock(&gVirtualThreadHideLock, Irql);
+
+        if(Thread == nullptr)
+            break;
+        ObDereferenceObject(Thread);
+    }
 }
 
 static bool HasVirtualThreadHide(PETHREAD Thread)
@@ -147,6 +398,34 @@ static void ThreadNotifyRoutine(HANDLE ProcessId, HANDLE ThreadId, BOOLEAN Creat
         RemoveVirtualThreadHide(ProcessId, ThreadId);
 }
 
+static void RegisterCreatedVirtualThreadHide(PHANDLE ThreadHandle)
+{
+    __try
+    {
+        ProbeForRead(ThreadHandle, sizeof(HANDLE), 1);
+        const HANDLE CreatedThreadHandle = *ThreadHandle;
+
+        PETHREAD Thread = nullptr;
+        NTSTATUS Status = ObReferenceObjectByHandle(
+                              CreatedThreadHandle,
+                              0,
+                              *PsThreadType,
+                              ExGetPreviousMode(),
+                              (PVOID*)&Thread,
+                              nullptr);
+        if(NT_SUCCESS(Status))
+        {
+            if(!Hooks::RegisterVirtualThreadHide(Thread))
+                RestoreHideFromDebugger(Thread);
+            ObDereferenceObject(Thread);
+        }
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER)
+    {
+        NOTHING;
+    }
+}
+
 static NTSTATUS NTAPI HookNtQueryInformationThread(
     IN HANDLE ThreadHandle,
     IN THREADINFOCLASS ThreadInformationClass,
@@ -154,10 +433,18 @@ static NTSTATUS NTAPI HookNtQueryInformationThread(
     IN ULONG ThreadInformationLength,
     OUT PULONG ReturnLength OPTIONAL)
 {
+    if(ExGetPreviousMode() == KernelMode)
+        return Undocumented::NtQueryInformationThread(
+                   ThreadHandle,
+                   ThreadInformationClass,
+                   ThreadInformation,
+                   ThreadInformationLength,
+                   ReturnLength);
+
     ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
-    ULONG targetPid = Misc::GetProcessIDFromThreadHandle(ThreadHandle);
 
 #ifdef _WIN64 // ThreadWow64Context returns STATUS_INVALID_INFO_CLASS on x86, and STATUS_INVALID_PARAMETER if PreviousMode is kernel
+    ULONG targetPid = Misc::GetProcessIDFromThreadHandle(ThreadHandle);
     if(ThreadInformationClass == ThreadWow64Context &&
             ThreadInformation != nullptr &&
             ThreadInformationLength == sizeof(WOW64_CONTEXT) &&
@@ -213,39 +500,37 @@ static NTSTATUS NTAPI HookNtQueryInformationThread(
     // Call the original function now, since querying ThreadHideFromDebugger may fail with STATUS_INVALID_INFO_CLASS (if we are on XP/2003)
     NTSTATUS Status = Undocumented::NtQueryInformationThread(ThreadHandle, ThreadInformationClass, ThreadInformation, ThreadInformationLength, ReturnLength);
 
-    if(NT_SUCCESS(Status) && ThreadInformationClass == ThreadHideFromDebugger)
+    if(NT_SUCCESS(Status) &&
+            ThreadInformationClass == ThreadHideFromDebugger &&
+            gThreadNotifyRegistered)
     {
-        if(gThreadNotifyRegistered &&
-                Hider::IsHidden(pid, HideThreadHideFromDebugger) &&
-                Hider::IsHidden(targetPid, HideThreadHideFromDebugger))
+        __try
         {
-            Log("[TITANHIDE] NtQueryInformationThread(ThreadHideFromDebugger) by %d\r\n", pid);
+            BACKUP_RETURNLENGTH();
 
-            __try
+            PETHREAD Thread = nullptr;
+            NTSTATUS ReferenceStatus = ObReferenceObjectByHandle(
+                                           ThreadHandle,
+                                           0,
+                                           *PsThreadType,
+                                           ExGetPreviousMode(),
+                                           (PVOID*)&Thread,
+                                           nullptr);
+            if(NT_SUCCESS(ReferenceStatus))
             {
-                BACKUP_RETURNLENGTH();
-
-                PETHREAD Thread = nullptr;
-                NTSTATUS ReferenceStatus = ObReferenceObjectByHandle(
-                                               ThreadHandle,
-                                               0,
-                                               *PsThreadType,
-                                               ExGetPreviousMode(),
-                                               (PVOID*)&Thread,
-                                               nullptr);
-                if(NT_SUCCESS(ReferenceStatus))
+                if(HasVirtualThreadHide(Thread))
                 {
-                    if(HasVirtualThreadHide(Thread))
-                        *(BOOLEAN*)ThreadInformation = TRUE;
-                    ObDereferenceObject(Thread);
+                    Log("[TITANHIDE] NtQueryInformationThread(ThreadHideFromDebugger) by %d\r\n", pid);
+                    *(BOOLEAN*)ThreadInformation = TRUE;
                 }
+                ObDereferenceObject(Thread);
+            }
 
-                RESTORE_RETURNLENGTH();
-            }
-            __except(EXCEPTION_EXECUTE_HANDLER)
-            {
-                Status = GetExceptionCode();
-            }
+            RESTORE_RETURNLENGTH();
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER)
+        {
+            Status = GetExceptionCode();
         }
     }
 
@@ -258,12 +543,22 @@ static NTSTATUS NTAPI HookNtSetInformationThread(
     IN PVOID ThreadInformation,
     IN ULONG ThreadInformationLength)
 {
+    if(ExGetPreviousMode() == KernelMode)
+        return Undocumented::NtSetInformationThread(
+                   ThreadHandle,
+                   ThreadInformationClass,
+                   ThreadInformation,
+                   ThreadInformationLength);
+
     const ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
+    const ULONG targetPid = Misc::GetProcessIDFromThreadHandle(ThreadHandle);
 
     //Bug found by Aguila, thanks!
     if(ThreadInformationClass == ThreadHideFromDebugger && !ThreadInformationLength)
     {
-        if(gThreadNotifyRegistered && Hider::IsHidden(pid, HideThreadHideFromDebugger))
+        if(gThreadNotifyRegistered &&
+                Hider::IsHidden(pid, HideThreadHideFromDebugger) &&
+                Hider::IsHidden(targetPid, HideThreadHideFromDebugger))
         {
             Log("[TITANHIDE] NtSetInformationThread(ThreadHideFromDebugger) by %d\r\n", pid);
             PETHREAD Thread;
@@ -335,6 +630,8 @@ static NTSTATUS NTAPI HookNtClose(
 {
     ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
     KPROCESSOR_MODE PreviousMode = ExGetPreviousMode();
+    if(PreviousMode == KernelMode)
+        return ObCloseHandle(Handle, KernelMode);
     if(Hider::IsHidden(pid, HideNtClose))
     {
         KeWaitForSingleObject(&gDebugPortMutex, Executive, KernelMode, FALSE, nullptr);
@@ -399,6 +696,15 @@ static NTSTATUS NTAPI HookNtDuplicateObject(
 {
     ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
     KPROCESSOR_MODE PreviousMode = ExGetPreviousMode();
+    if(PreviousMode == KernelMode)
+        return Undocumented::NtDuplicateObject(
+                   SourceProcessHandle,
+                   SourceHandle,
+                   TargetProcessHandle,
+                   TargetHandle,
+                   DesiredAccess,
+                   HandleAttributes,
+                   Options);
     if(Hider::IsHidden(pid, HideNtClose))
     {
         BOOLEAN BeingDebugged = PsGetProcessDebugPort(PsGetCurrentProcess()) != nullptr;
@@ -438,6 +744,13 @@ static NTSTATUS NTAPI HookNtQuerySystemInformation(
     IN ULONG SystemInformationLength,
     OUT PULONG ReturnLength OPTIONAL)
 {
+    if(ExGetPreviousMode() == KernelMode)
+        return Undocumented::NtQuerySystemInformation(
+                   SystemInformationClass,
+                   SystemInformation,
+                   SystemInformationLength,
+                   ReturnLength);
+
     NTSTATUS ret = Undocumented::NtQuerySystemInformation(SystemInformationClass, SystemInformation, SystemInformationLength, ReturnLength);
     if(NT_SUCCESS(ret) && SystemInformation)
     {
@@ -653,13 +966,16 @@ static NTSTATUS NTAPI HookNtQueryObject(
                 BACKUP_RETURNLENGTH();
 
                 OBJECT_TYPE_INFORMATION* type = (OBJECT_TYPE_INFORMATION*)ObjectInformation;
-                if(IsDebugObjectTypeInformation(type, ObjectInformationLength, &DebugObject))
+                DEBUG_OBJECT_CONTRIBUTION Contribution;
+                if(QueryDebugObjectContribution(&Contribution) &&
+                        IsDebugObjectTypeInformation(type,
+                                                     ObjectInformationLength,
+                                                     ReturnLength,
+                                                     &DebugObject,
+                                                     &gDebugObjectTypeSignature))
                 {
                     Log("[TITANHIDE] DebugObject by %d\r\n", pid);
-
-                    DEBUG_OBJECT_CONTRIBUTION Contribution;
-                    if(QueryDebugObjectContribution(&Contribution))
-                        RemoveDebugObjectContribution(type, &Contribution);
+                    RemoveDebugObjectContribution(type, &Contribution);
                 }
 
                 RESTORE_RETURNLENGTH();
@@ -685,42 +1001,76 @@ static NTSTATUS NTAPI HookNtQueryObject(
                     return ret;
                 }
 
-                unsigned int TotalObjects = pObjectAllInfo->NumberOfObjects;
-                for(unsigned int i = 0; i < TotalObjects; i++)
+                DEBUG_OBJECT_CONTRIBUTION Contribution;
+                if(QueryDebugObjectContribution(&Contribution))
                 {
-                    if(pObjInfoLocation > BufferEnd ||
-                            (SIZE_T)(BufferEnd - pObjInfoLocation) < sizeof(OBJECT_TYPE_INFORMATION))
+                    // NumberOfObjects and any UNICODE_STRING member may have
+                    // been overwritten by ReturnLength. Walk bounded inline
+                    // names and use the live debug object's fixed type
+                    // descriptor as an independent identifier.
+                    while(pObjInfoLocation <= BufferEnd &&
+                            (SIZE_T)(BufferEnd - pObjInfoLocation) >= sizeof(OBJECT_TYPE_INFORMATION))
                     {
-                        break;
-                    }
+                        OBJECT_TYPE_INFORMATION* pObjectTypeInfo =
+                            (OBJECT_TYPE_INFORMATION*)pObjInfoLocation;
+                        ProbeForRead(pObjectTypeInfo, sizeof(OBJECT_TYPE_INFORMATION), 1);
 
-                    OBJECT_TYPE_INFORMATION* pObjectTypeInfo = (OBJECT_TYPE_INFORMATION*)pObjInfoLocation;
-                    ProbeForRead(pObjectTypeInfo, sizeof(OBJECT_TYPE_INFORMATION), 1);
-
-                    // The name is inline after the fixed structure. TypeName.Buffer
-                    // may have been overwritten by an overlapping ReturnLength.
-                    unsigned char* InlineTypeName = (unsigned char*)(pObjectTypeInfo + 1);
-                    if(InlineTypeName > BufferEnd ||
-                            pObjectTypeInfo->TypeName.MaximumLength > (SIZE_T)(BufferEnd - InlineTypeName))
-                    {
-                        break;
-                    }
-
-                    if(pObjectTypeInfo->TypeName.Length == DebugObject.Length &&
-                            pObjectTypeInfo->TypeName.Length <= pObjectTypeInfo->TypeName.MaximumLength &&
-                            RtlCompareMemory(InlineTypeName, DebugObject.Buffer, DebugObject.Length) == DebugObject.Length)
-                    {
-                        Log("[TITANHIDE] DebugObject by %d\r\n", pid);
-                        DEBUG_OBJECT_CONTRIBUTION Contribution;
-                        if(QueryDebugObjectContribution(&Contribution))
+                        unsigned char* InlineTypeName =
+                            (unsigned char*)(pObjectTypeInfo + 1);
+                        const bool DescriptorMatches =
+                            IsDebugObjectTypeDescriptor(
+                                pObjectTypeInfo,
+                                ReturnLength,
+                                &gDebugObjectTypeSignature);
+                        const bool NameMatches =
+                            (SIZE_T)(BufferEnd - InlineTypeName) >=
+                                DebugObject.Length + sizeof(WCHAR) &&
+                            !RangesOverlap(InlineTypeName,
+                                           DebugObject.Length + sizeof(WCHAR),
+                                           ReturnLength,
+                                           sizeof(ULONG)) &&
+                            RtlCompareMemory(InlineTypeName,
+                                             DebugObject.Buffer,
+                                             DebugObject.Length) == DebugObject.Length &&
+                            *(WCHAR*)(InlineTypeName + DebugObject.Length) == L'\0';
+                        if(DescriptorMatches || NameMatches)
+                        {
+                            Log("[TITANHIDE] DebugObject by %d\r\n", pid);
                             RemoveDebugObjectContribution(pObjectTypeInfo, &Contribution);
-                    }
+                            break;
+                        }
 
-                    ULONG_PTR Next = (ULONG_PTR)InlineTypeName + pObjectTypeInfo->TypeName.MaximumLength;
-                    Next = (Next + sizeof(void*) - 1) & -(LONG_PTR)sizeof(void*);
-                    if(Next <= (ULONG_PTR)pObjInfoLocation || Next > (ULONG_PTR)BufferEnd)
-                        break;
-                    pObjInfoLocation = (unsigned char*)Next;
+                        SIZE_T InlineAllocationLength = 0;
+                        if(!RangesOverlap(&pObjectTypeInfo->TypeName.MaximumLength,
+                                          sizeof(pObjectTypeInfo->TypeName.MaximumLength),
+                                          ReturnLength,
+                                          sizeof(ULONG)) &&
+                                pObjectTypeInfo->TypeName.MaximumLength >= sizeof(WCHAR) &&
+                                pObjectTypeInfo->TypeName.MaximumLength <=
+                                    (SIZE_T)(BufferEnd - InlineTypeName))
+                        {
+                            InlineAllocationLength = pObjectTypeInfo->TypeName.MaximumLength;
+                        }
+                        else
+                        {
+                            WCHAR* Character = (WCHAR*)InlineTypeName;
+                            while((SIZE_T)(BufferEnd - (unsigned char*)Character) >= sizeof(WCHAR) &&
+                                    *Character != L'\0')
+                            {
+                                Character++;
+                            }
+                            if((SIZE_T)(BufferEnd - (unsigned char*)Character) < sizeof(WCHAR))
+                                break;
+                            InlineAllocationLength =
+                                (SIZE_T)((unsigned char*)(Character + 1) - InlineTypeName);
+                        }
+
+                        ULONG_PTR Next = (ULONG_PTR)InlineTypeName + InlineAllocationLength;
+                        Next = (Next + sizeof(void*) - 1) & -(LONG_PTR)sizeof(void*);
+                        if(Next <= (ULONG_PTR)pObjInfoLocation || Next > (ULONG_PTR)BufferEnd)
+                            break;
+                        pObjInfoLocation = (unsigned char*)Next;
+                    }
                 }
 
                 RESTORE_RETURNLENGTH();
@@ -948,6 +1298,15 @@ static NTSTATUS NTAPI HookNtSystemDebugControl(
     IN ULONG OutputBufferLength,
     OUT PULONG ReturnLength)
 {
+    if(ExGetPreviousMode() == KernelMode)
+        return Undocumented::NtSystemDebugControl(
+                   Command,
+                   InputBuffer,
+                   InputBufferLength,
+                   OutputBuffer,
+                   OutputBufferLength,
+                   ReturnLength);
+
     ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
     if(Command != SysDbgGetTriageDump && Command != SysDbgGetLiveKernelDump &&
             Hider::IsHidden(pid, HideNtSystemDebugControl))
@@ -971,20 +1330,53 @@ static NTSTATUS NTAPI HookNtCreateThreadEx(
     IN SIZE_T MaximumStackSize OPTIONAL,
     IN PPS_ATTRIBUTE_LIST AttributeList OPTIONAL)
 {
+    if(ExGetPreviousMode() == KernelMode)
+        return Undocumented::NtCreateThreadEx(
+                   ThreadHandle,
+                   DesiredAccess,
+                   ObjectAttributes,
+                   ProcessHandle,
+                   StartRoutine,
+                   Argument,
+                   CreateFlags,
+                   ZeroBits,
+                   StackSize,
+                   MaximumStackSize,
+                   AttributeList);
+
     const ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
-    if(Hider::IsHidden(pid, HideThreadHideFromDebugger))
+    const ULONG targetPid = Misc::GetProcessIDFromProcessHandle(ProcessHandle);
+    const bool VirtualizeThreadHide =
+        gThreadNotifyRegistered &&
+        (CreateFlags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER) != 0 &&
+        Hider::IsHidden(pid, HideThreadHideFromDebugger) &&
+        Hider::IsHidden(targetPid, HideThreadHideFromDebugger);
+    if(VirtualizeThreadHide)
     {
-        if((CreateFlags & THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER) != 0)
-        {
-            CreateFlags &= ~THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER;
-            Log("[TITANHIDE] NtCreateThreadEx with THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER by %u\r\n", pid);
-        }
+        CreateFlags &= ~THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER;
+        Log("[TITANHIDE] NtCreateThreadEx with THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER by %u\r\n", pid);
     }
-    return Undocumented::NtCreateThreadEx(ThreadHandle, DesiredAccess, ObjectAttributes, ProcessHandle, StartRoutine, Argument, CreateFlags, ZeroBits, StackSize, MaximumStackSize, AttributeList);
+
+    NTSTATUS Status = Undocumented::NtCreateThreadEx(
+                          ThreadHandle,
+                          DesiredAccess,
+                          ObjectAttributes,
+                          ProcessHandle,
+                          StartRoutine,
+                          Argument,
+                          CreateFlags,
+                          ZeroBits,
+                          StackSize,
+                          MaximumStackSize,
+                          AttributeList);
+    if(NT_SUCCESS(Status) && VirtualizeThreadHide)
+        RegisterCreatedVirtualThreadHide(ThreadHandle);
+    return Status;
 }
 
 int Hooks::Initialize()
 {
+    InitializeDebugObjectTypeSignature();
     KeInitializeMutex(&gDebugPortMutex, 0);
     KeInitializeSpinLock(&gVirtualThreadHideLock);
     gVirtualThreadHideEntryCount = 0;
@@ -1053,9 +1445,5 @@ void Hooks::Deinitialize()
         gThreadNotifyRegistered = false;
     }
 
-    while(gVirtualThreadHideEntryCount != 0)
-    {
-        PETHREAD Thread = gVirtualThreadHideEntries[--gVirtualThreadHideEntryCount].Thread;
-        ObDereferenceObject(Thread);
-    }
+    RestoreVirtualThreadHides(0, true);
 }

@@ -258,12 +258,17 @@ bool CheckThreadHideFromDebuggerContract()
         HANDLE, ULONG, PVOID, ULONG, PULONG);
     typedef NTSTATUS(NTAPI * NT_SET_INFORMATION_THREAD)(
         HANDLE, ULONG, PVOID, ULONG);
+    typedef NTSTATUS(NTAPI * NT_CREATE_THREAD_EX)(
+        PHANDLE, ACCESS_MASK, PVOID, HANDLE, PVOID, PVOID, ULONG,
+        SIZE_T, SIZE_T, SIZE_T, PVOID);
 
     NT_QUERY_INFORMATION_THREAD NtQIT = (NT_QUERY_INFORMATION_THREAD)
             GetProcAddress(GetModuleHandle(TEXT("ntdll.dll")), "NtQueryInformationThread");
     NT_SET_INFORMATION_THREAD NtSIT = (NT_SET_INFORMATION_THREAD)
             GetProcAddress(GetModuleHandle(TEXT("ntdll.dll")), "NtSetInformationThread");
-    if(NtQIT == nullptr || NtSIT == nullptr)
+    NT_CREATE_THREAD_EX NtCTE = (NT_CREATE_THREAD_EX)
+            GetProcAddress(GetModuleHandle(TEXT("ntdll.dll")), "NtCreateThreadEx");
+    if(NtQIT == nullptr || NtSIT == nullptr || NtCTE == nullptr)
         return false;
 
     HANDLE Thread = CreateThread(nullptr, 0, ContractThreadProc, nullptr, CREATE_SUSPENDED, nullptr);
@@ -294,6 +299,41 @@ bool CheckThreadHideFromDebuggerContract()
     if(!NT_SUCCESS(Status) || Hidden != TRUE || ReturnLength != sizeof(Hidden))
     {
         printf("ThreadHideFromDebugger virtual-state mismatch: %08X, %u, %u\n",
+               Status, Hidden, ReturnLength);
+        Detected = true;
+    }
+
+    TerminateThread(Thread, 0);
+    CloseHandle(Thread);
+
+    // A thread created with the hide flag has the same observable state as one
+    // hidden later through NtSetInformationThread.
+    const ULONG ThreadCreateFlagsCreateSuspended = 0x1;
+    const ULONG ThreadCreateFlagsHideFromDebugger = 0x4;
+    Thread = nullptr;
+    Status = NtCTE(&Thread,
+                   THREAD_ALL_ACCESS,
+                   nullptr,
+                   GetCurrentProcess(),
+                   (PVOID)ContractThreadProc,
+                   nullptr,
+                   ThreadCreateFlagsCreateSuspended | ThreadCreateFlagsHideFromDebugger,
+                   0,
+                   0,
+                   0,
+                   nullptr);
+    if(!NT_SUCCESS(Status) || Thread == nullptr)
+    {
+        printf("NtCreateThreadEx hide-state setup failed: %08X\n", Status);
+        return true;
+    }
+
+    Hidden = FALSE;
+    ReturnLength = 0;
+    Status = NtQIT(Thread, 0x11, &Hidden, sizeof(Hidden), &ReturnLength);
+    if(!NT_SUCCESS(Status) || Hidden != TRUE || ReturnLength != sizeof(Hidden))
+    {
+        printf("NtCreateThreadEx hide-state mismatch: %08X, %u, %u\n",
                Status, Hidden, ReturnLength);
         Detected = true;
     }
@@ -340,6 +380,26 @@ typedef struct _OBJECT_TYPE_INFORMATION
     UNICODE_STRING TypeName;
     ULONG TotalNumberOfObjects;
     ULONG TotalNumberOfHandles;
+    ULONG TotalPagedPoolUsage;
+    ULONG TotalNonPagedPoolUsage;
+    ULONG TotalNamePoolUsage;
+    ULONG TotalHandleTableUsage;
+    ULONG HighWaterNumberOfObjects;
+    ULONG HighWaterNumberOfHandles;
+    ULONG HighWaterPagedPoolUsage;
+    ULONG HighWaterNonPagedPoolUsage;
+    ULONG HighWaterNamePoolUsage;
+    ULONG HighWaterHandleTableUsage;
+    ULONG InvalidAttributes;
+    GENERIC_MAPPING GenericMapping;
+    ULONG ValidAccessMask;
+    BOOLEAN SecurityRequired;
+    BOOLEAN MaintainHandleCount;
+    UCHAR TypeIndex;
+    CHAR ReservedByte;
+    ULONG PoolType;
+    ULONG DefaultPagedPoolCharge;
+    ULONG DefaultNonPagedPoolCharge;
 } OBJECT_TYPE_INFORMATION, *POBJECT_TYPE_INFORMATION;
 
 typedef struct _OBJECT_ALL_INFORMATION
@@ -588,7 +648,9 @@ bool CheckObjectTypesInformationOverlapContract()
 
     OBJECT_ALL_INFORMATION* All = (OBJECT_ALL_INFORMATION*)Buffer;
     unsigned char* Location = (unsigned char*)All->ObjectTypeInformation;
-    PULONG Overlap = nullptr;
+    SIZE_T DebugObjectOffset = (SIZE_T)-1;
+    SIZE_T PreviousObjectOffset = (SIZE_T)-1;
+    SIZE_T PreviousOffset = (SIZE_T)-1;
     const wchar_t DebugObject[] = L"DebugObject";
     const USHORT DebugObjectLength = sizeof(DebugObject) - sizeof(wchar_t);
     for(ULONG i = 0; i < All->NumberOfObjects; i++)
@@ -597,24 +659,51 @@ bool CheckObjectTypesInformationOverlapContract()
         if(Type->TypeName.Length == DebugObjectLength &&
                 memcmp(Type->TypeName.Buffer, DebugObject, DebugObjectLength) == 0)
         {
-            Overlap = (PULONG)&Type->TypeName.Buffer;
+            DebugObjectOffset = (SIZE_T)(Location - Buffer);
+            PreviousObjectOffset = PreviousOffset;
             break;
         }
+        PreviousOffset = (SIZE_T)(Location - Buffer);
         Location = (unsigned char*)Type->TypeName.Buffer + Type->TypeName.MaximumLength;
         Location = (unsigned char*)(((ULONG_PTR)Location + sizeof(void*) - 1) &
                                     -(LONG_PTR)sizeof(void*));
     }
 
-    bool Detected = Overlap == nullptr;
-    if(Overlap == nullptr)
-        puts("ObjectTypesInformation did not contain DebugObject");
-    if(Overlap != nullptr)
+    bool Detected = DebugObjectOffset == (SIZE_T)-1 ||
+                    PreviousObjectOffset == (SIZE_T)-1;
+    if(Detected)
+        puts("ObjectTypesInformation did not contain a preceding DebugObject entry");
+    if(!Detected)
     {
-        Status = NtQO(nullptr, ObjectTypesInformation, Buffer, BufferSize, Overlap);
-        if(!NT_SUCCESS(Status) || *Overlap != ActualLength)
+        const SIZE_T OverlapOffsets[] =
         {
-            printf("ObjectTypesInformation overlap contract mismatch: %08X\n", Status);
-            Detected = true;
+            DebugObjectOffset + FIELD_OFFSET(OBJECT_TYPE_INFORMATION, TypeName.Buffer),
+            PreviousObjectOffset + FIELD_OFFSET(OBJECT_TYPE_INFORMATION, TypeName.MaximumLength),
+            DebugObjectOffset + sizeof(OBJECT_TYPE_INFORMATION),
+            DebugObjectOffset + FIELD_OFFSET(OBJECT_TYPE_INFORMATION, TypeIndex)
+        };
+        for(ULONG i = 0; i < ARRAYSIZE(OverlapOffsets); i++)
+        {
+            ULONG NewActualLength = 0;
+            Status = NtQO(nullptr,
+                          ObjectTypesInformation,
+                          Buffer,
+                          BufferSize,
+                          &NewActualLength);
+            if(!NT_SUCCESS(Status))
+            {
+                printf("ObjectTypesInformation overlap reset failed: %08X\n", Status);
+                Detected = true;
+                break;
+            }
+
+            PULONG Overlap = (PULONG)(Buffer + OverlapOffsets[i]);
+            Status = NtQO(nullptr, ObjectTypesInformation, Buffer, BufferSize, Overlap);
+            if(!NT_SUCCESS(Status) || *Overlap != NewActualLength)
+            {
+                printf("ObjectTypesInformation overlap %u mismatch: %08X\n", i, Status);
+                Detected = true;
+            }
         }
     }
 
